@@ -50,6 +50,18 @@ class AutoInterface(
     private val peers = ConcurrentHashMap<String, PeerInfo>()
     private val spawnedPeers = ConcurrentHashMap<String, AutoInterfacePeer>()
 
+    // D7 hardening (2026-08-22): remember recently-seen peers BEYOND the
+    // peering timeout. On networks where IPv6 multicast is unreliable
+    // (QEMU/SLIRP emulators, some Wi-Fi APs), discovery announcements flap:
+    // a peer that misses a few mcast packets is pruned, then any inbound
+    // DATA packet arriving in the de-registered window was dropped with
+    // "Data from unknown peer". Instead: if the sender's address was seen
+    // within PEER_REMEMBER_MS (default 10 minutes), RE-HYDRATE the peer
+    // (re-spawn the AutoInterfacePeer and re-register it with Transport)
+    // and deliver the frame. Only addresses never seen (or stale beyond
+    // the remember window) are still treated as unknown.
+    private val rememberWindow = PeerRememberWindow()
+
     // Adaptive announce interval: fast after changes, progressively slower when stable.
     // Receiving peers' multicast is free (socket.receive blocks without CPU cost).
     // Sending is what costs battery, so we only need to send often enough that
@@ -464,8 +476,20 @@ class AutoInterface(
                     // Refresh peer and forward data
                     peer.refresh()
                     peer.handleIncomingData(data)
+                } else if (rememberWindow.isRecentlyKnown(senderAddrStr, System.currentTimeMillis()) &&
+                    rehydratePeer(senderAddrStr)
+                ) {
+                    // Peer was pruned by the discovery-timeout window but we
+                    // have seen this address recently — re-spawn the peer
+                    // interface and deliver this frame instead of dropping it
+                    // (D7 hardening: emulator mcast flapping must not lose
+                    // inbound GROUP data).
+                    spawnedPeers[senderAddrStr]?.let { hydrated ->
+                        hydrated.refresh()
+                        hydrated.handleIncomingData(data)
+                        log("Rehydrated recently-known peer $senderAddrStr — delivered ${data.size} bytes")
+                    }
                 } else {
-                    // Unknown peer - might be a new discovery
                     log("Data from unknown peer: $senderAddrStr")
                 }
             } catch (e: SocketException) {
@@ -703,6 +727,9 @@ class AutoInterface(
 
         log("Discovered peer: $cleanAddr on $interfaceName")
 
+        // D7: mark this address as recently-seen for the remember window
+        rememberWindow.onSeen(cleanAddr, System.currentTimeMillis())
+
         // Create AutoInterfacePeer interface
         // For IPv6 link-local addresses, we need to include the scope ID (interface)
         // to ensure proper routing
@@ -754,12 +781,34 @@ class AutoInterface(
 
         peers.remove(address)
 
+        // D7: keep the address in the remember window — a pruned peer whose
+        // data arrives within PEER_REMEMBER_MS is rehydrated instead of
+        // dropped. The entry expires via the window check.
+
         val peer = spawnedPeers.remove(address)
         if (peer != null) {
             spawnedInterfaces?.remove(peer)
             peer.detach()
             Transport.deregisterInterface(peer.toRef())
         }
+    }
+
+    /**
+     * D7 hardening: if [address] was a REAL peer within
+     * [AutoInterfaceConstants.PEER_REMEMBER_MS], re-spawn its
+     * AutoInterfacePeer and re-register it with Transport (the same work
+     * addPeer does after discovery). Returns true when a peer interface is
+     * available again for this address.
+     */
+    private fun rehydratePeer(address: String): Boolean {
+        val cleanAddr = address.substringBefore('%')
+        if (!rememberWindow.isRecentlyKnown(cleanAddr, System.currentTimeMillis())) return false
+        val ifName = peers[cleanAddr]?.interfaceName
+            ?: linkLocalAddresses.keys.firstOrNull()
+            ?: return false
+        log("Rehydrating recently-known peer $cleanAddr on $ifName")
+        addPeer(cleanAddr, ifName)
+        return spawnedPeers.containsKey(cleanAddr)
     }
 
     /**

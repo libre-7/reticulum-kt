@@ -42,6 +42,15 @@ object AutoInterfaceConstants {
     const val MULTI_IF_DEQUE_TTL = 0.75        // seconds to remember packets
     val MULTI_IF_DEQUE_TTL_MS = (MULTI_IF_DEQUE_TTL * 1000).toLong()
 
+    // D7 hardening (2026-08-22): how long a pruned peer's address stays
+    // eligible for rehydration when inbound DATA arrives from it. Generous
+    // by design — multicast flapping (emulator QEMU/SLIRP, congested Wi-Fi)
+    // must not cost us inbound GROUP traffic. Data or discovery from the
+    // peer refreshes the window, so a continuously-talking peer never goes
+    // "unknown" no matter how flaky its discovery announcements are.
+    const val PEER_REMEMBER = 600.0            // seconds (10 minutes)
+    val PEER_REMEMBER_MS = (PEER_REMEMBER * 1000).toLong()
+
     // Platform-specific ignored interfaces
     val LINUX_IGNORE_IFS = listOf("lo")
     val DARWIN_IGNORE_IFS = listOf("awdl0", "llw0", "lo0", "en5")
