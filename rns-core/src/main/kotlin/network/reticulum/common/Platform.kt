@@ -40,6 +40,15 @@ object Platform {
         get() = if (isAndroid) 50_000 else 1_000_000
 
     /**
+     * Get the recommended maximum number of known destinations to retain.
+     * Oldest entries are evicted beyond this bound (both in memory and in the
+     * periodic on-disk save), so identity/announce caches stay bounded on
+     * long-running Android processes instead of growing without limit.
+     */
+    val recommendedKnownDestinationsSize: Int
+        get() = if (isAndroid) 20_000 else 200_000
+
+    /**
      * Get the recommended max queued announces for this platform.
      */
     val recommendedMaxQueuedAnnounces: Int

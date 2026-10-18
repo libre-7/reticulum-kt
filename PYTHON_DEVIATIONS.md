@@ -118,3 +118,48 @@ All 4 ratchet lifecycle tests pass, including:
 - Ratchet extraction from announce
 - Full lifecycle encrypt/decrypt
 - Cross-implementation encrypt/decrypt
+
+## Identity: Bounded known_destinations cache (memory + periodic save)
+
+**What differs:** `Identity.knownDestinations` is capped at
+`Platform.recommendedKnownDestinationsSize` (20k entries on Android, 200k on
+JVM) instead of growing without limit. Overflow evicts the oldest entries by
+`timestamp`, oldest-first, in three places: amortized during `remember()`
+(trim once 10% over the cap), during `loadKnownDestinations()`, and against the
+union of memory + on-disk entries during `saveKnownDestinations()`.
+
+Python RNS keeps `Identity.known_destinations` unbounded and serializes the
+whole dict to `known_destinations` (msgpack) on exit/periodically.
+
+**Why:** On Android the map reached 93,853 entries in normal Callout mesh use,
+and the periodic save (every 5 min via `Transport`) held the whole file
+(`readBytes()`), a full `Map<ByteArray, List<Any?>>` parse of it, and a
+`ByteArrayOutputStream` of the merged map — three ~32 MiB buffers per save,
+which repeatedly OOM-killed the mesh service (Oct 2026 crash class). The cache
+is a discovery/announce cache: an evicted destination re-announces and is
+re-learned, so eviction is safe.
+
+**Risk:** A destination whose identity has been evicted cannot be resolved
+until it announces again (same risk profile as any cache miss; no protocol
+change). Wire format of the `known_destinations` file is unchanged
+(msgpack map: dest_hash -> [timestamp, packet_hash, public_key, app_data|nil]).
+
+**Additional note:** `saveKnownDestinations()` no longer merges on-disk entries
+back into the in-memory map. Python serializes the in-memory dict as-is, so
+the previous merge was the deviation. Startup still loads the file into memory
+(then caps it).
+
+## Transport: Platform-scaled packet hashlist cap
+
+**What differs:** Hashlist rotation uses `Platform.recommendedHashlistSize`
+(50,000 on Android, 1,000,000 on JVM) instead of the fixed
+`TransportConstants.HASHLIST_MAXSIZE` (1M) constant, and
+`loadPacketHashlist()` stops after `hashlistMaxSize` entries.
+
+**Why:** The 1M desktop constant meant an Android mesh service could accumulate
+1M 32-byte hashes (~2x that while rotated) before eviction. 50k is the
+port's own platform recommendation; the dedupe window remains hours of traffic
+at mesh rates.
+
+**Risk:** Duplicate suppression window is shorter on Android. No wire or file
+format change (still one hex hash per line).

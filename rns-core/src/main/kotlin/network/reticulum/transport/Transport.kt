@@ -2063,15 +2063,40 @@ object Transport {
     }
 
     /**
+     * Maximum number of packet hashes retained before the hashlist rotates.
+     *
+     * Defaults to [network.reticulum.common.Platform.recommendedHashlistSize]
+     * (50k on Android, 1M on JVM). Tests may lower it.
+     */
+    @JvmStatic
+    var hashlistMaxSize: Int = network.reticulum.common.Platform.recommendedHashlistSize
+
+    /**
      * Save packet hashlist to a file.
      *
-     * Format: one hash per line, hex-encoded
+     * Format: one hash per line, hex-encoded.
+     *
+     * Streams entries through a buffered writer instead of materialising the
+     * whole hashlist as a List<String> plus a joined String — at the 1M-entry
+     * desktop cap that double buffer cost >130 MiB and OOM-killed Android
+     * processes during shutdown saves.
      */
     fun savePacketHashlist(file: java.io.File) {
         try {
-            val hashes = (packetHashlist + packetHashlistPrev).map { it.toString() }
-            file.writeText(hashes.joinToString("\n"))
-            log("Saved ${hashes.size} packet hashes to ${file.absolutePath}")
+            var written = 0
+            file.bufferedWriter(Charsets.UTF_8, 64 * 1024).use { writer ->
+                for (key in packetHashlist) {
+                    writer.write(key.toString())
+                    writer.write("\n")
+                    written++
+                }
+                for (key in packetHashlistPrev) {
+                    writer.write(key.toString())
+                    writer.write("\n")
+                    written++
+                }
+            }
+            log("Saved $written packet hashes to ${file.absolutePath}")
         } catch (e: Exception) {
             log("Failed to save packet hashlist: ${e.message}")
         }
@@ -2079,22 +2104,34 @@ object Transport {
 
     /**
      * Load packet hashlist from a file.
+     *
+     * Streams line-by-line and stops at [hashlistMaxSize] entries so a large or
+     * legacy hashlist file cannot balloon startup memory on constrained devices.
      */
     fun loadPacketHashlist(file: java.io.File) {
         if (!file.exists()) return
         try {
-            val lines = file.readLines().filter { it.isNotBlank() }
+            val max = hashlistMaxSize
             var loaded = 0
-            for (line in lines) {
-                try {
-                    val hash = hexToBytes(line.trim())
-                    packetHashlist.add(hash.toKey())
-                    loaded++
-                } catch (e: Exception) {
-                    // Skip malformed entries
+            var skipped = 0
+            file.bufferedReader(Charsets.UTF_8, 64 * 1024).useLines { lines ->
+                for (line in lines) {
+                    val trimmed = line.trim()
+                    if (trimmed.isEmpty()) continue
+                    if (loaded >= max) {
+                        skipped++
+                        continue
+                    }
+                    try {
+                        packetHashlist.add(hexToBytes(trimmed).toKey())
+                        loaded++
+                    } catch (e: Exception) {
+                        // Skip malformed entries
+                    }
                 }
             }
-            log("Loaded $loaded packet hashes from ${file.absolutePath}")
+            val capNote = if (skipped > 0) " (skipped $skipped beyond cap $max)" else ""
+            log("Loaded $loaded packet hashes from ${file.absolutePath}$capNote")
         } catch (e: Exception) {
             log("Failed to load packet hashlist: ${e.message}")
         }
@@ -4883,12 +4920,12 @@ object Transport {
         return false
     }
 
-    private fun addPacketHash(hash: ByteArray) {
+    internal fun addPacketHash(hash: ByteArray) {
         val key = hash.toKey()
         packetHashlist.add(key)
 
-        // Rotate hashlist if too large
-        if (packetHashlist.size > TransportConstants.HASHLIST_MAXSIZE) {
+        // Rotate hashlist if too large (platform cap: 50k Android / 1M JVM)
+        if (packetHashlist.size > hashlistMaxSize) {
             packetHashlistPrev.clear()
             packetHashlistPrev.addAll(packetHashlist)
             packetHashlist.clear()
@@ -4906,6 +4943,20 @@ object Transport {
             packetHashlistPrev.clear()
         }
     }
+
+    /**
+     * Number of hashes currently in the active packet hashlist.
+     * Diagnostics and tests only.
+     */
+    @JvmStatic
+    fun packetHashlistSize(): Int = packetHashlist.size
+
+    /**
+     * Number of hashes retained in the previous (rotated) packet hashlist.
+     * Diagnostics and tests only.
+     */
+    @JvmStatic
+    fun packetHashlistPrevSize(): Int = packetHashlistPrev.size
 
     // ===== Background Jobs =====
 

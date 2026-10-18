@@ -98,6 +98,16 @@ class Identity private constructor(
         private val knownDestinations = ConcurrentHashMap<ByteArrayKey, IdentityData>()
 
         /**
+         * Maximum number of known destinations retained in memory and in the
+         * periodic on-disk save. Oldest entries (by timestamp) are evicted
+         * beyond this bound. Defaults to
+         * [network.reticulum.common.Platform.recommendedKnownDestinationsSize];
+         * tests may lower it.
+         */
+        @JvmStatic
+        var knownDestinationsMaxSize: Int = network.reticulum.common.Platform.recommendedKnownDestinationsSize
+
+        /**
          * Index for identity hash lookups: identity_hash -> destination_hash
          */
         private val identityHashIndex = ConcurrentHashMap<ByteArrayKey, ByteArray>()
@@ -378,6 +388,13 @@ class Identity private constructor(
             // Index by identity hash for reverse lookups
             val identityHash = Hashes.truncatedHash(publicKey)
             identityHashIndex[identityHash.toKey()] = destHash.copyOf()
+
+            // Amortized cap: trim oldest when 10% over so runtime growth is bounded
+            // without paying an O(n log n) sort on every insert.
+            val cap = knownDestinationsMaxSize
+            if (cap > 0 && knownDestinations.size > cap + (cap / 10)) {
+                pruneKnownDestinationsTo(cap)
+            }
         }
 
         /**
@@ -412,6 +429,35 @@ class Identity private constructor(
          * Get the number of known destinations.
          */
         fun knownDestinationCount(): Int = knownDestinations.size
+
+        /**
+         * Evict the oldest known destinations beyond [max] so the cache stays
+         * bounded on long-running processes. Removes both the map entry and the
+         * identity-hash index entry (only when the index still points at this
+         * destination, so a surviving destination of the same identity keeps
+         * its reverse lookup).
+         *
+         * @return number of entries evicted
+         */
+        fun pruneKnownDestinationsTo(max: Int = knownDestinationsMaxSize): Int {
+            if (max <= 0 || knownDestinations.size <= max) return 0
+            val excess = knownDestinations.size - max
+            val oldest = knownDestinations.entries
+                .sortedBy { it.value.timestamp }
+                .take(excess)
+            var removed = 0
+            for (entry in oldest) {
+                knownDestinations.remove(entry.key)
+                val identityHash = Hashes.truncatedHash(entry.value.publicKey)
+                val indexKey = identityHash.toKey()
+                val mapped = identityHashIndex[indexKey]
+                if (mapped != null && mapped.contentEquals(entry.key.bytes)) {
+                    identityHashIndex.remove(indexKey)
+                }
+                removed++
+            }
+            return removed
+        }
 
         /**
          * Validate an announce packet and extract the announced identity.
@@ -604,92 +650,178 @@ class Identity private constructor(
 
                 val destFile = java.io.File(storagePath, "known_destinations")
 
-                // Load existing data from disk to merge
-                val storageKnownDestinations = mutableMapOf<ByteArray, List<Any?>>()
+                // ---- Streamed merge + cap. No whole-file reads, no full-map
+                // payload copy, no ByteArrayOutputStream: the old implementation
+                // held destFile.readBytes() + Map<ByteArray, List<Any?>> + a
+                // second in-memory copy — ~3x the file size every 5 minutes
+                // (32 MiB each against ~94k destinations) and OOM-killed Android.
+                //
+                // Pass 1: index on-disk keys + timestamps only (payloads skipped).
+                val diskOnlyEntries = ArrayList<Pair<ByteArrayKey, Long>>()
                 if (destFile.exists()) {
                     try {
-                        val packer = org.msgpack.core.MessagePack.newDefaultUnpacker(destFile.readBytes())
-                        val mapSize = packer.unpackMapHeader()
-                        repeat(mapSize) {
-                            val keyLen = packer.unpackBinaryHeader()
-                            val key = ByteArray(keyLen)
-                            packer.readPayload(key)
-
-                            packer.unpackArrayHeader() // Skip array size, we know the format
-                            val timestamp = packer.unpackLong()
-
-                            val packetHashLen = packer.unpackBinaryHeader()
-                            val packetHash = ByteArray(packetHashLen)
-                            packer.readPayload(packetHash)
-
-                            val publicKeyLen = packer.unpackBinaryHeader()
-                            val publicKey = ByteArray(publicKeyLen)
-                            packer.readPayload(publicKey)
-
-                            val appData = if (packer.tryUnpackNil()) {
-                                null
-                            } else {
-                                val appDataLen = packer.unpackBinaryHeader()
-                                val data = ByteArray(appDataLen)
-                                packer.readPayload(data)
-                                data
+                        java.io.BufferedInputStream(destFile.inputStream(), 64 * 1024).use { input ->
+                            val unpacker = org.msgpack.core.MessagePack.newDefaultUnpacker(input)
+                            val mapSize = unpacker.unpackMapHeader()
+                            var i = 0
+                            var aborted = false
+                            while (i < mapSize && !aborted) {
+                                try {
+                                    val keyLen = unpacker.unpackBinaryHeader()
+                                    val keyBytes = ByteArray(keyLen)
+                                    unpacker.readPayload(keyBytes)
+                                    val arrayLen = unpacker.unpackArrayHeader()
+                                    val timestamp = unpacker.unpackLong()
+                                    repeat(maxOf(0, arrayLen - 1)) { unpacker.skipValue() }
+                                    val key = keyBytes.toKey()
+                                    if (!knownDestinations.containsKey(key)) {
+                                        diskOnlyEntries.add(key to timestamp)
+                                    }
+                                } catch (e: Exception) {
+                                    // A desynchronised stream cannot be recovered; stop indexing.
+                                    aborted = true
+                                }
+                                i++
                             }
-
-                            storageKnownDestinations[key] = listOf(timestamp, packetHash, publicKey, appData)
+                            unpacker.close()
                         }
-                        packer.close()
                     } catch (e: Exception) {
                         // Ignore errors loading existing data
                     }
                 }
 
-                // Merge storage data with in-memory data (prefer in-memory)
-                for ((destHash, value) in storageKnownDestinations) {
-                    val key = destHash.toKey()
-                    if (!knownDestinations.containsKey(key)) {
-                        // Convert list format to IdentityData
-                        val timestamp = value[0] as Long
-                        val packetHash = value[1] as ByteArray
-                        val publicKey = value[2] as ByteArray
-                        val appData = value[3] as ByteArray?
+                // Fixed snapshot of in-memory entries so the packed entry count
+                // matches the map header even if announces arrive mid-save.
+                val memorySnapshot = knownDestinations.entries.map { it.key to it.value }
+                val memoryKeys = memorySnapshot.mapTo(HashSet()) { it.first }
 
-                        knownDestinations[key] = IdentityData(timestamp, packetHash, publicKey, appData)
+                // Cap the union (memory + disk-only) oldest-first.
+                val maxSize = knownDestinationsMaxSize
+                val dropDiskKeys = HashSet<ByteArrayKey>()
+                val evictedMemoryKeys = HashSet<ByteArrayKey>()
+                if (maxSize > 0) {
+                    val unionSize = memorySnapshot.size + diskOnlyEntries.size
+                    if (unionSize > maxSize) {
+                        val excess = unionSize - maxSize
+                        val oldest = (memorySnapshot.map { it.first to it.second.timestamp } +
+                            diskOnlyEntries).sortedBy { it.second }.take(excess)
+                        for ((key, _) in oldest) {
+                            if (memoryKeys.contains(key)) {
+                                evictedMemoryKeys.add(key)
+                                val data = knownDestinations.remove(key)
+                                if (data != null) {
+                                    val identityHash = Hashes.truncatedHash(data.publicKey)
+                                    val indexKey = identityHash.toKey()
+                                    val mapped = identityHashIndex[indexKey]
+                                    if (mapped != null && mapped.contentEquals(key.bytes)) {
+                                        identityHashIndex.remove(indexKey)
+                                    }
+                                }
+                            } else {
+                                dropDiskKeys.add(key)
+                            }
+                        }
                     }
                 }
+                val toWrite = memorySnapshot.size - evictedMemoryKeys.size +
+                    diskOnlyEntries.size - dropDiskKeys.size
+                println("Saving $toWrite known destinations to storage...")
 
-                println("Saving ${knownDestinations.size} known destinations to storage...")
-
-                // Serialize to msgpack
-                val buffer = java.io.ByteArrayOutputStream()
-                val packer = org.msgpack.core.MessagePack.newDefaultPacker(buffer)
-
-                packer.packMapHeader(knownDestinations.size)
-                for ((key, data) in knownDestinations) {
-                    // Pack destination hash (key)
-                    packer.packBinaryHeader(key.bytes.size)
-                    packer.writePayload(key.bytes)
-
-                    // Pack value as array: [timestamp, packet_hash, public_key, app_data]
-                    packer.packArrayHeader(4)
-                    packer.packLong(data.timestamp)
-                    packer.packBinaryHeader(data.packetHash.size)
-                    packer.writePayload(data.packetHash)
-                    packer.packBinaryHeader(data.publicKey.size)
-                    packer.writePayload(data.publicKey)
-
-                    if (data.appData == null) {
-                        packer.packNil()
-                    } else {
-                        packer.packBinaryHeader(data.appData.size)
-                        packer.writePayload(data.appData)
-                    }
-                }
-                packer.close()
-
-                // Write to file atomically
                 val tempFile = java.io.File(storagePath, "known_destinations.tmp")
-                tempFile.writeBytes(buffer.toByteArray())
-                tempFile.renameTo(destFile)
+                var packed = 0
+                java.io.BufferedOutputStream(tempFile.outputStream(), 64 * 1024).use { output ->
+                    val packer = org.msgpack.core.MessagePack.newDefaultPacker(output)
+                    packer.packMapHeader(toWrite)
+
+                    // In-memory entries win over disk on conflicts.
+                    for ((key, data) in memorySnapshot) {
+                        if (evictedMemoryKeys.contains(key)) continue
+                        packer.packBinaryHeader(key.bytes.size)
+                        packer.writePayload(key.bytes)
+                        packer.packArrayHeader(4)
+                        packer.packLong(data.timestamp)
+                        packer.packBinaryHeader(data.packetHash.size)
+                        packer.writePayload(data.packetHash)
+                        packer.packBinaryHeader(data.publicKey.size)
+                        packer.writePayload(data.publicKey)
+                        if (data.appData == null) {
+                            packer.packNil()
+                        } else {
+                            packer.packBinaryHeader(data.appData.size)
+                            packer.writePayload(data.appData)
+                        }
+                        packed++
+                    }
+
+                    // Pass 2: stream disk-only survivors straight through.
+                    if (packed < toWrite && destFile.exists()) {
+                        java.io.BufferedInputStream(destFile.inputStream(), 64 * 1024).use { input ->
+                            val unpacker = org.msgpack.core.MessagePack.newDefaultUnpacker(input)
+                            val mapSize = unpacker.unpackMapHeader()
+                            var i = 0
+                            while (i < mapSize && packed < toWrite) {
+                                try {
+                                    val keyLen = unpacker.unpackBinaryHeader()
+                                    val keyBytes = ByteArray(keyLen)
+                                    unpacker.readPayload(keyBytes)
+                                    val key = keyBytes.toKey()
+                                    val keep = !memoryKeys.contains(key) && !dropDiskKeys.contains(key)
+                                    val arrayLen = unpacker.unpackArrayHeader()
+                                    if (arrayLen != 4) {
+                                        repeat(maxOf(0, arrayLen - 1)) { unpacker.skipValue() }
+                                    } else {
+                                        val timestamp = unpacker.unpackLong()
+                                        val phLen = unpacker.unpackBinaryHeader()
+                                        val packetHash = ByteArray(phLen)
+                                        unpacker.readPayload(packetHash)
+                                        val pkLen = unpacker.unpackBinaryHeader()
+                                        val publicKey = ByteArray(pkLen)
+                                        unpacker.readPayload(publicKey)
+                                        val appData = if (unpacker.tryUnpackNil()) {
+                                            null
+                                        } else {
+                                            val adLen = unpacker.unpackBinaryHeader()
+                                            val d = ByteArray(adLen)
+                                            unpacker.readPayload(d)
+                                            d
+                                        }
+                                        if (keep) {
+                                            packer.packBinaryHeader(keyBytes.size)
+                                            packer.writePayload(keyBytes)
+                                            packer.packArrayHeader(4)
+                                            packer.packLong(timestamp)
+                                            packer.packBinaryHeader(packetHash.size)
+                                            packer.writePayload(packetHash)
+                                            packer.packBinaryHeader(publicKey.size)
+                                            packer.writePayload(publicKey)
+                                            if (appData == null) {
+                                                packer.packNil()
+                                            } else {
+                                                packer.packBinaryHeader(appData.size)
+                                                packer.writePayload(appData)
+                                            }
+                                            packed++
+                                        }
+                                    }
+                                } catch (e: Exception) {
+                                    break
+                                }
+                                i++
+                            }
+                            unpacker.close()
+                        }
+                    }
+
+                    packer.close()
+                }
+
+                if (packed != toWrite) {
+                    // Never leave a partially-written (corrupt) destinations file.
+                    tempFile.delete()
+                    println("Aborting known destinations save: packed $packed of $toWrite entries")
+                } else {
+                    tempFile.renameTo(destFile)
+                }
 
                 val saveTime = System.currentTimeMillis() - saveStart
                 val timeStr = if (saveTime < 1000) {
@@ -734,7 +866,11 @@ class Identity private constructor(
             }
 
             try {
-                val packer = org.msgpack.core.MessagePack.newDefaultUnpacker(destFile.readBytes())
+                // Stream from disk instead of readBytes(): the file reached
+                // 32 MiB at ~94k destinations, and reading it whole tripled
+                // peak memory during startup.
+                val inputStream = java.io.BufferedInputStream(destFile.inputStream(), 64 * 1024)
+                val packer = org.msgpack.core.MessagePack.newDefaultUnpacker(inputStream)
                 val mapSize = packer.unpackMapHeader()
 
                 var loadedCount = 0
@@ -796,6 +932,11 @@ class Identity private constructor(
                 packer.close()
 
                 println("Loaded $loadedCount known destinations from storage")
+
+                val prunedCount = pruneKnownDestinationsTo()
+                if (prunedCount > 0) {
+                    println("Pruned $prunedCount oldest known destinations beyond cap $knownDestinationsMaxSize")
+                }
 
             } catch (e: Exception) {
                 println("Error loading known destinations from disk, file will be recreated on exit: ${e.message}")
