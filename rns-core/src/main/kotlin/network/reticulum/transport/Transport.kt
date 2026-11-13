@@ -3379,21 +3379,65 @@ object Transport {
             // If packet has an attached interface, only send on that interface
             // Python: attached_interface restricts announce to a single interface
             val targetInterface = packet.attachedInterface
+            var fallBackToBroadcast = false
             if (targetInterface != null) {
                 log("Sending to $destHex on attached interface ${targetInterface.name} (${packedData.size} bytes)")
-                if (targetInterface.canSend && targetInterface.online) {
+                // The accessors can throw on a torn-down ref; that is exactly the
+                // unavailable case the fallback below exists for, so it must not
+                // escape and abort the emission.
+                if (isUsableForSend(targetInterface)) {
                     transmit(targetInterface, packedData)
                     sent = true
                 } else {
-                    log("Attached interface ${targetInterface.name} is not available")
+                    // TARGETED EMISSION WITH AN UNAVAILABLE TARGET (2026-11-13):
+                    // this is the branch every PATH_RESPONSE takes. It used to
+                    // leave `sent = false` and give up, so a response attached to
+                    // an unavailable instance was silently dropped and
+                    // `requestPath` starved.
+                    //
+                    // Both attach sites in this file (processPathRequest :2574
+                    // and :2615) pass the RECEIVING interface, which just
+                    // delivered the request, so attachment is normally to a live
+                    // instance — `findInterfaceByHash` plays no part in it, and
+                    // the dead-twin duplicate-registration defect reaches the
+                    // path-routed DATA branch instead (fixed there and in the
+                    // app's revive path). What remains reachable HERE is (a) the
+                    // race where that instance goes offline between inbound
+                    // dispatch and this write (reader EOF / teardown on another
+                    // thread) and (b) any caller of the public
+                    // `Destination.announce(attachedInterface = …)` API that
+                    // attaches an offline ref. Prefer a live instance under the
+                    // SAME name so a duplicate registration still targets the
+                    // right route; otherwise fall through to the broadcast below
+                    // rather than drop the response.
+                    //
+                    // Deviation from Python's single-interface attempt: Python
+                    // also tries only `attached_interface` and lets an unavailable
+                    // instance end the emission. Here the alternative is a
+                    // permanent silent drop, which the app cannot observe or
+                    // recover from (see port-deviations.md).
+                    val liveTwin = interfaces.firstOrNull { candidate ->
+                        candidate !== targetInterface &&
+                            candidate.name == targetInterface.name &&
+                            isUsableForSend(candidate)
+                    }
+                    if (liveTwin != null) {
+                        log("Attached interface ${targetInterface.name} is not available — using the live instance registered under the same name")
+                        transmit(liveTwin, packedData)
+                        sent = true
+                    } else {
+                        log("Attached interface ${targetInterface.name} is not available — falling back to broadcast")
+                        fallBackToBroadcast = true
+                    }
                 }
-            } else {
+            }
+            if (targetInterface == null || (!sent && fallBackToBroadcast)) {
                 // Broadcast on all interfaces
-                val ifaceNames = interfaces.filter { it.canSend && it.online }.map { it.name }
+                val ifaceNames = interfaces.filter { isUsableForSend(it) }.map { it.name }
                 log("Broadcasting to $destHex on ${ifaceNames.size} interfaces: $ifaceNames (${packedData.size} bytes)")
 
                 for (iface in interfaces) {
-                    if (!iface.canSend || !iface.online) continue
+                    if (!isUsableForSend(iface)) continue
 
                     // LINK packets should only be sent on the link's attached interface
                     // (Python Transport.py:1031-1035)
@@ -6367,9 +6411,37 @@ object Transport {
 
     // ===== Helpers =====
 
+    /**
+     * Can this interface be handed a packet right now?
+     *
+     * Defensive on purpose: RNS accessors throw when an interface was torn down
+     * mid-read (the app's transport snapshot wraps them for the same reason). A
+     * throwing ref is simply not usable; it must not abort a whole emission,
+     * least of all the PATH_RESPONSE fallback that exists because of it.
+     */
+    private fun isUsableForSend(ref: InterfaceRef): Boolean = try {
+        ref.canSend && ref.online
+    } catch (_: Exception) {
+        false
+    }
+
     private fun findInterfaceByHash(hash: ByteArray): InterfaceRef? {
         val key = hash.toKey()
-        return interfaces.find { it.hash.toKey() == key }
+        // DUPLICATE REGISTRATIONS (2026-11-13): an interface hash is derived
+        // from the interface NAME, and `registerInterface` is a bare add, so a
+        // revived interface (same host:port -> same name -> same hash, new
+        // instance) leaves its detached twin registered FIRST. Returning
+        // `first()` therefore hands every path-routed send to the dead instance,
+        // where `transmit()` swallows the refusal ("Transmit error … not
+        // online") and the caller still sees `sent = true` — the grant-send
+        // failure class. Python keeps the interface OBJECT in its tables and
+        // never faces this ambiguity; preferring a usable instance with the same
+        // hash is the faithful port of "route on the interface that received
+        // it". Falls back to the previous first-match behaviour when NO instance
+        // under that hash is usable, so path-expiry decisions are unchanged.
+        val matches = interfaces.filter { it.hash.toKey() == key }
+        return matches.firstOrNull { isUsableForSend(it) }
+            ?: matches.firstOrNull()
             ?: localClientInterfaces.find { it.hash.toKey() == key }
     }
 
