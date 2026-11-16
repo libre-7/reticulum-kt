@@ -339,6 +339,28 @@ object Transport {
     private val interfaces = CopyOnWriteArrayList<InterfaceRef>()
 
     /**
+     * Guards the compound "find the entry registered under this hash, then
+     * replace it" step of [registerInterface]'s upsert (and the matching
+     * removal in [deregisterInterface]).
+     *
+     * `CopyOnWriteArrayList` makes each individual `add` / `set` / `remove`
+     * atomic, but an upsert is `indexOfFirst` followed by `set` — two separate
+     * operations. Without this monitor a concurrent `remove` could shift the
+     * index between them, and the `set` would overwrite an UNRELATED interface,
+     * silently dropping it from routing. Python mutates its
+     * `Transport.interfaces` list only from single-threaded config-time code
+     * (`Transport.py:1300-1320`), so it cannot reach this; kotlin allows
+     * runtime register/deregister churn from the app (`ReticulumService`'s
+     * spawned-client registrar loop, `AutoInterface` peer churn).
+     *
+     * Lock order: if both monitors are taken, [interfaceRegistryLock] is taken
+     * first. [registerInterface] releases it before touching
+     * [sharedInstanceFlagLock], and [deregisterInterface] takes them in that
+     * same order, so the pair cannot deadlock.
+     */
+    private val interfaceRegistryLock = Any()
+
+    /**
      * Monitor guarding compound mutations of [isConnectedToSharedInstance]
      * together with the `interfaces` collection scan that decides whether
      * to clear it. The `interfaces` list itself is a `CopyOnWriteArrayList`
@@ -579,6 +601,41 @@ object Transport {
         announceAllowedAt.clear()
         heldAnnounceEntries.clear()
         localClientInterfaces.clear()
+        // The interface registry is interface-derived state: after a stop no
+        // interface is registered, so the next start must begin from an empty
+        // list. Before this, `interfaces` was never cleared and every
+        // stop/start cycle appended a fresh set of instances on top of the
+        // previous (dead) ones — measured on-device as 8 dead + 8 live refs
+        // after one cycle, i.e. a 16-entry interface list for 8 interfaces.
+        //
+        // The dropped instances are NOT detached here: Transport does not own
+        // their lifecycle (the app / AutoInterface does), and detaching a ref
+        // whose owner is still tearing it down would close a socket underneath
+        // it. What stop() guarantees is that nothing stays REGISTERED.
+        //
+        // Path reuse across restarts is unaffected: [pathTable] is persisted to
+        // [pathStore] before the clears above and reloaded by [start], and
+        // [isDanglingPath] deliberately does not cull restored entries while no
+        // interface is registered (the restore-before-interfaces window). The
+        // app's `Loaded N path entries` log line comes from that reload.
+        interfaces.clear()
+        // Per-interface traffic / announce bookkeeping is keyed by interface
+        // hash. It is bounded by the number of distinct interfaces (not by the
+        // number of restarts), but a revived interface would otherwise inherit
+        // the previous session's counters and a stale `lastActivity`, which
+        // feeds [prioritizeInterfaces] and every stats-based verdict in the
+        // app. Cleared for the same reason as the registry: no interface is
+        // left for these rows to describe.
+        interfaceStats.clear()
+        interfaceAnnounceQueues.clear()
+        interfaceAnnounceAllowedAt.clear()
+        // No interface is registered any more, so none of them can be a
+        // shared-instance client. Reticulum.shutdown() clears this too; doing
+        // it here keeps a bare Transport.stop()/start() cycle (tests, the
+        // conformance bridge, any embedder) from leaving the flag true, which
+        // would make processOutbound HEADER_2-wrap for a shared instance that
+        // is no longer attached.
+        synchronized(sharedInstanceFlagLock) { isConnectedToSharedInstance = false }
         queuedAnnounces.clear()
         announceRateTable.clear()
         pathRequests.clear()
@@ -900,14 +957,33 @@ object Transport {
     /**
      * Register an interface with transport.
      * Automatically detects and tracks local client interfaces (Python RNS compatibility).
+     *
+     * Registration is an UPSERT keyed by [InterfaceRef.hash], not an append.
+     * An interface's hash is derived from `Interface.getHash()`, which hashes
+     * `toString()` — and every interface's `toString()` is a function of its
+     * rendezvous (`TCPClientInterface[name -> host:port]`,
+     * `AutoInterfacePeer[Auto[name, addr] -> /addr:port]`, …). A REVIVED
+     * interface is therefore a NEW instance under the SAME hash, and appending
+     * it left the dead twin registered first: `findInterfaceByHash` could hand
+     * every path-routed send to it, and the app's interface enumeration grew by
+     * one dead entry per stop/start cycle.
+     *
+     * So: registering an interface whose hash is already present REPLACES the
+     * existing entry in place (same position, so broadcast/announce ordering is
+     * stable across a revive) and collapses any duplicate left by the old
+     * append-only behaviour. The superseded instance stops being routable
+     * immediately; it is not detached (Transport doesn't own its lifecycle) and
+     * its traffic-stats row is NOT dropped — stats are keyed by hash, and a
+     * revive is the same logical interface, so counters continue. Only an
+     * explicit [deregisterInterface] discards a stats row.
      */
     fun registerInterface(interfaceRef: InterfaceRef) {
-        interfaces.add(interfaceRef)
+        upsertInterface(interfaceRef)
 
         // Python: Track interfaces spawned by local shared instance server
         // Matches Python logic: if interface.parent_interface?.is_local_shared_instance
         if (interfaceRef.parentInterface?.isLocalSharedInstance == true) {
-            localClientInterfaces.add(interfaceRef)
+            localClientInterfaces.addIfAbsent(interfaceRef)
             log("Registered local client interface: ${interfaceRef.name}")
         } else if (interfaceRef.isConnectedToSharedInstance) {
             // Client connecting TO shared instance (not spawned BY server).
@@ -944,11 +1020,62 @@ object Transport {
     }
 
     /**
+     * Insert or refresh [interfaceRef] in [interfaces], keyed by hash.
+     *
+     * A first registration appends. A registration whose hash already exists
+     * replaces that entry **in place** (index preserved) and removes any further
+     * entries carrying the same hash, so the list holds at most one ref per
+     * hash no matter how many times an interface is revived. The superseded
+     * instances are also dropped from [localClientInterfaces] — a stale entry
+     * there is what `findInterfaceByHash`'s local-client fallback would
+     * otherwise return for a revived shared-instance client.
+     *
+     * @return true when an existing entry was replaced or a duplicate collapsed.
+     */
+    private fun upsertInterface(interfaceRef: InterfaceRef): Boolean {
+        val key = interfaceRef.hash.toKey()
+        var superseded: InterfaceRef? = null
+        var collapsed = 0
+        synchronized(interfaceRegistryLock) {
+            val index = interfaces.indexOfFirst { it.hash.toKey() == key }
+            if (index < 0) {
+                interfaces.add(interfaceRef)
+                return@synchronized
+            }
+            val previous = interfaces.set(index, interfaceRef)
+            if (previous !== interfaceRef) superseded = previous
+            // Collapse duplicates an append-only registry may already hold
+            // (pre-existing state in a long-lived process, or a caller that
+            // registered the same hash more than once).
+            var i = interfaces.size - 1
+            while (i > index) {
+                if (interfaces[i].hash.toKey() == key) {
+                    interfaces.removeAt(i)
+                    collapsed++
+                }
+                i--
+            }
+        }
+        if (superseded == null && collapsed == 0) return false
+        superseded?.let { localClientInterfaces.remove(it) }
+        log(
+            "Interface ${interfaceRef.name} (hash ${interfaceRef.hash.toHexString()}) registered as an upsert: " +
+                (if (superseded != null) "replaced the previously registered instance" else "entry refreshed") +
+                (if (collapsed > 0) ", collapsed $collapsed duplicate entry/entries" else "") +
+                " — superseded instance(s) are no longer routed",
+        )
+        return true
+    }
+
+    /**
      * Deregister an interface.
      * Cleans up associated statistics and announce queues.
      */
     fun deregisterInterface(interfaceRef: InterfaceRef) {
-        interfaces.remove(interfaceRef)
+        // Removal by identity only: a ref for the same hash that is still live
+        // in the registry is a different instance and must keep routing (that is
+        // the whole point of the hash-keyed upsert above).
+        synchronized(interfaceRegistryLock) { interfaces.remove(interfaceRef) }
         localClientInterfaces.remove(interfaceRef)
 
         // Clean up interface-related data
@@ -1907,10 +2034,14 @@ object Transport {
 
     /**
      * Register a local client interface.
+     *
+     * Same hash-keyed upsert as [registerInterface]: a revived local client
+     * must not leave its dead twin registered (nor a duplicate entry in
+     * [localClientInterfaces]).
      */
     fun registerLocalClientInterface(interfaceRef: InterfaceRef) {
-        localClientInterfaces.add(interfaceRef)
-        interfaces.add(interfaceRef)
+        upsertInterface(interfaceRef)
+        localClientInterfaces.addIfAbsent(interfaceRef)
         log("Registered local client interface: ${interfaceRef.name}")
     }
 
@@ -1919,7 +2050,7 @@ object Transport {
      */
     fun deregisterLocalClientInterface(interfaceRef: InterfaceRef) {
         localClientInterfaces.remove(interfaceRef)
-        interfaces.remove(interfaceRef)
+        synchronized(interfaceRegistryLock) { interfaces.remove(interfaceRef) }
         log("Deregistered local client interface: ${interfaceRef.name}")
     }
 
@@ -6485,16 +6616,20 @@ object Transport {
     private fun findInterfaceByHash(hash: ByteArray): InterfaceRef? {
         val key = hash.toKey()
         // DUPLICATE REGISTRATIONS (2026-11-13): an interface hash is derived
-        // from the interface NAME, and `registerInterface` is a bare add, so a
-        // revived interface (same host:port -> same name -> same hash, new
-        // instance) leaves its detached twin registered FIRST. Returning
-        // `first()` therefore hands every path-routed send to the dead instance,
-        // where `transmit()` swallows the refusal ("Transmit error … not
-        // online") and the caller still sees `sent = true` — the grant-send
-        // failure class. Python keeps the interface OBJECT in its tables and
-        // never faces this ambiguity; preferring a usable instance with the same
-        // hash is the faithful port of "route on the interface that received
-        // it". Falls back to the previous first-match behaviour when NO instance
+        // from the interface NAME, so a revived interface (same host:port ->
+        // same name -> same hash, new instance) used to leave its detached twin
+        // registered FIRST, and returning `first()` handed every path-routed
+        // send to the dead instance — where `transmit()` swallows the refusal
+        // ("Transmit error … not online") and the caller still sees
+        // `sent = true`: the grant-send failure class. Python keeps the
+        // interface OBJECT in its tables and never faces this ambiguity.
+        //
+        // Since the registry became a hash-keyed upsert (registerInterface),
+        // at most one ref per hash can be registered, so there is no twin to
+        // prefer. The usable-first selection is kept as cheap defence for the
+        // remaining cases: a lone ref that went offline between lookup and
+        // send, and any list a caller mutated around deregisterInterface.
+        // Falls back to the previous first-match behaviour when NO instance
         // under that hash is usable, so path-expiry decisions are unchanged.
         val matches = interfaces.filter { it.hash.toKey() == key }
         return matches.firstOrNull { isUsableForSend(it) }

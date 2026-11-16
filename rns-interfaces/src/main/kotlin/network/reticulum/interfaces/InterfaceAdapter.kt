@@ -4,7 +4,6 @@ import network.reticulum.common.InterfaceMode
 import network.reticulum.common.RnsConstants
 import network.reticulum.transport.InterfaceRef
 import network.reticulum.transport.Transport
-import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Adapter to bridge Interface to InterfaceRef for Transport integration.
@@ -132,10 +131,37 @@ class InterfaceAdapter private constructor(
     }
 
     companion object {
-        // Cache adapters to avoid creating duplicates
-        private val adapterCache = ConcurrentHashMap<Interface, InterfaceAdapter>()
+        /**
+         * Per-interface adapter cache.
+         *
+         * Weak keys AND weak values, on purpose. This used to be a plain
+         * `ConcurrentHashMap<Interface, InterfaceAdapter>` — a static, strongly
+         * held map keyed by instance, so every `Interface` ever adapted (one set
+         * per stop/start cycle, per spawned AutoInterface peer, per accepted TCP
+         * client) was retained for the life of the process. On a device that
+         * restarts Reticulum (Doze, network changes, service restarts) that is
+         * an unbounded leak of dead interfaces and their adapters.
+         *
+         * Weakness does not cost identity stability, which is what
+         * `Transport.deregisterInterface` relies on when it removes a ref by
+         * reference: an `Interface` keeps its adapter alive through the
+         * `onPacketReceived` callback wired in the adapter's `init`, and a
+         * registered adapter is strongly held by `Transport.interfaces`. So for
+         * every interface that is reachable at all, `getOrCreate` returns the
+         * same adapter; entries only disappear once the interface itself does.
+         *
+         * Keys are compared by `equals`, which for the whole `Interface`
+         * hierarchy is identity (no subclass overrides it) — deliberate: two
+         * distinct instances must never share an adapter.
+         */
+        private val adapterCache = java.util.WeakHashMap<Interface, java.lang.ref.WeakReference<InterfaceAdapter>>()
+        private val adapterCacheLock = Any()
 
-        fun getOrCreate(iface: Interface): InterfaceAdapter = adapterCache.computeIfAbsent(iface) { InterfaceAdapter(iface) }
+        fun getOrCreate(iface: Interface): InterfaceAdapter = synchronized(adapterCacheLock) {
+            adapterCache[iface]?.get() ?: InterfaceAdapter(iface).also {
+                adapterCache[iface] = java.lang.ref.WeakReference(it)
+            }
+        }
     }
 }
 

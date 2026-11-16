@@ -156,7 +156,13 @@ class AutoInterface(
     }
 
     override fun detach() {
-        if (!running.getAndSet(false)) return
+        // Full, idempotent teardown. The old guard was
+        // `if (!running.getAndSet(false)) return`, which made detach a no-op
+        // when start() had failed partway (it sets running back to false) or was
+        // never called — leaving spawned peer interfaces REGISTERED with
+        // Transport forever, since only removePeer() deregisters. A teardown
+        // that cannot run is how peers accumulated across restarts.
+        if (!running.getAndSet(false) && detached.get()) return
 
         log("Detaching AutoInterface...")
         setOnline(false)
@@ -180,12 +186,39 @@ class AutoInterface(
         discoverySocketsOut.values.forEach { it.close() }
         dataSockets.values.forEach { it.close() }
 
-        // Detach all spawned peers
-        spawnedPeers.values.forEach { it.detach() }
+        // Detach all spawned peers AND deregister them from Transport, exactly
+        // as removePeer() does. Detaching alone only clears the peer's online /
+        // detached flags: the InterfaceRef stayed in Transport.interfaces, so
+        // every AutoInterface teardown leaked one registered peer per peer
+        // address (same defect class as the dead-twin registry entries — a ref
+        // that is detached but still registered).
+        spawnedPeers.values.forEach { peer ->
+            spawnedInterfaces?.remove(peer)
+            peer.detach()
+            Transport.deregisterInterface(peer.toRef())
+        }
         spawnedPeers.clear()
         peers.clear()
 
         log("AutoInterface detached")
+    }
+
+    /**
+     * Test seam: adopt an already-constructed [peer] as if [addPeer] had spawned
+     * it for [address] — populates the peer maps and registers the peer ref with
+     * Transport, without opening multicast sockets or touching the network.
+     *
+     * Exists because [addPeer] resolves the peer's IPv6 link-local address via
+     * `NetworkInterface`, which no test host can guarantee; the invariant under
+     * test ("detach() leaves no peer refs registered") only needs the peer to be
+     * in the maps and in Transport.
+     */
+    internal fun adoptPeerForTest(address: String, peer: AutoInterfacePeer) {
+        val cleanAddr = address.substringBefore('%')
+        peers.putIfAbsent(cleanAddr, PeerInfo(peer.interfaceName))
+        spawnedPeers[cleanAddr] = peer
+        spawnedInterfaces?.add(peer)
+        Transport.registerInterface(peer.toRef())
     }
 
     override fun processOutgoing(data: ByteArray) {
@@ -758,6 +791,9 @@ class AutoInterface(
             log("Cleaning up stale peer interface for $cleanAddr")
             spawnedInterfaces?.remove(it)
             it.detach()
+            // Detach alone leaves the ref registered — the same leak
+            // removePeer()/detach() no longer produce.
+            Transport.deregisterInterface(it.toRef())
         }
         spawnedInterfaces?.add(peer)
 
