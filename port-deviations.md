@@ -358,3 +358,17 @@ A residual narrow TOCTOU remains between `doAdvertise()`'s guard and the subsequ
 Separately, `findInterfaceByHash` now prefers a usable instance among duplicates sharing a hash. That is NOT a deviation: python stores the interface OBJECT in `path_table`/`link_table` and resumes on that object, whereas this port stores a hash and re-resolves it; preferring a usable registration is the faithful port of the object reference when the name-derived hash has several registrations.
 
 **Re-evaluation:** if the app layer stops reviving interfaces as new instances under the same name (or `registerInterface` dedupes by hash), the twin rung becomes dead code and only the unavailable-instance race justifies the broadcast fallback. If upstream RNS ever adds a retry/broadcast fallback for an unavailable `attached_interface`, port that exact structure and delete this entry.
+
+### Attached emission to a multi-hop destination is refused — `rns-core/.../transport/Transport.kt::processOutbound`
+
+**Python reference:** `RNS/Transport.py` outbound: a non-announce packet with a known path is sent via the path branch (HEADER_2 with `next_hop` as transport id when `hops > 1`). If the path entry has expired, or its interface is gone, that branch is skipped and an `attached_interface` emission goes out as HEADER_1 with no transport id, restricted to one interface.
+
+**Category:** protocol safety — forced by a measured wire failure; arguably an upstream defect.
+
+**Date:** 2026-11-16.
+
+**Tracking:** Callout trace (2026-11-13/16): `TX PACKET: flags=0x00 hops=0 dest=… size=483` (HEADER_1 SINGLE DATA, `transportId == null`) for a destination the path table knew was multi-hop. The directly-connected hub accepted it and dropped it; the identical payload path-directed used `flags=0x50` (HEADER_2) and was delivered on the same hub. The app logged TRANSMITTED and nothing arrived.
+
+**Description:** `processOutbound`'s attached-interface branch now refuses a HEADER_1 emission when the path-table lookup for the destination exists with `hops > 1` and the packet is a path-forwarded shape (DATA/LINKREQUEST). It logs the interface, destination hash and hop count, transmits nothing (no attached send, no broadcast fallback) and returns `false`; callers see `Transport.outbound() == false` and `Packet.send()` returns a null receipt instead of a false success. `hops == 1` attached sends (on-link delivery), destinations with no path entry (the pathless/broadcast shape), and path-routed multi-hop sends are unchanged. ANNOUNCE is exempt because PATH_RESPONSEs are attached by construction and `pathTable[dest].hops` describes the announced destination, not the response's recipient — refusing those would starve `requestPath` across multi-hop networks. PROOF is exempt (reverseTable forwards HEADER_1 proofs), LINK DATA is exempt (linkTable keys on the linkId), PLAIN/GROUP are exempt (broadcast-style), and HEADER_2 is exempt (the caller already selected a transport hop). The path entry is the one this emission resolved; a stale entry removed just above still identifies a multi-hop destination, so that shape is refused too.
+
+**Re-evaluation:** if upstream RNS adds the same hop-aware refusal, replace this guard with its structure. If a legitimate use of `attachedInterface` for a multi-hop HEADER_1 DATA packet appears, it must be expressed as a path-directed send (or HEADER_2) — the hub cannot forward the HEADER_1 form, so relaxing this guard only restores the silent drop.

@@ -3374,6 +3374,63 @@ object Transport {
         }
 
         if (!sent) {
+            // ATTACHED EMISSION TO A MULTI-HOP DESTINATION (2026-11-16):
+            // `attachedInterface` pins the emission to one interface and
+            // bypasses the path-routing branch above. That is only sound when
+            // the attached interface can reach the destination directly (one
+            // hop), or when the packet is not path-forwarded at all
+            // (ANNOUNCE, PROOF, PLAIN/GROUP, LINK). A HEADER_1 SINGLE DATA
+            // packet for a multi-hop destination leaves with
+            // `transportId == null`; the directly-connected transport accepts
+            // it and then drops it, because the relay path in processInbound
+            // only forwards multi-hop packets whose transportId matches its own
+            // identity (HEADER_2). The sender logs a normal transmit and
+            // nothing ever arrives — unobservable from the public API, so the
+            // hop-aware layer has to refuse rather than let any caller produce
+            // that packet.
+            //
+            // `pathEntry` is this emission's pathTable lookup (above). A live
+            // multi-hop path never reaches here — it is HEADER_2-wrapped and
+            // sent on the path interface first. The shapes that do reach here
+            // are an expired path entry and an entry whose receiving interface
+            // vanished (removed from the table just above); both still say the
+            // destination is multi-hop, so both are refused.
+            //
+            // Exemptions, each a working case that must not become a refusal:
+            //  - ANNOUNCE: PATH_RESPONSEs are attached by construction
+            //    (processPathRequest :2574, :2615); pathTable hops describe the
+            //    announced destination, not the response's recipient.
+            //  - PLAIN/GROUP: broadcast-style, never path-forwarded.
+            //  - LINK: link DATA stays HEADER_1 by design and is forwarded via
+            //    linkTable, which keys on the linkId (destinationHash).
+            //  - PROOF: forwarded via reverseTable (and linkTable for LRPROOF)
+            //    as HEADER_1; a proof never needs a transport id.
+            //  - HEADER_2: the caller has already chosen a transport hop; the
+            //    packet is forwardable by the node named in its transport id.
+            // The caller observes a non-transmitted outcome as `outbound`
+            // returning false (same contract as "no usable interface"), with
+            // nothing written and no exception thrown.
+            val attachedRef = packet.attachedInterface
+            val multiHopHops = pathEntry?.takeIf { it.hops > 1 }?.hops
+            if (attachedRef != null &&
+                multiHopHops != null &&
+                packet.headerType == HeaderType.HEADER_1 &&
+                packet.packetType != PacketType.ANNOUNCE &&
+                packet.packetType != PacketType.PROOF &&
+                packet.destinationType != DestinationType.PLAIN &&
+                packet.destinationType != DestinationType.GROUP &&
+                packet.destinationType != DestinationType.LINK
+            ) {
+                log(
+                    "REFUSING attached emission to $destHex on ${attachedRef.name}: " +
+                        "destination is $multiHopHops hops away, and a HEADER_1 packet " +
+                        "attached to one interface is not forwardable by the next " +
+                        "transport (it relays only HEADER_2 with its own transport id); " +
+                        "packet left unsent",
+                )
+                return false
+            }
+
             addPacketHash(packet.packetHash)
 
             // If packet has an attached interface, only send on that interface
